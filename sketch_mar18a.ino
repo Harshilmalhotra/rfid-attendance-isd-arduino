@@ -4,7 +4,9 @@
 #include <MFRC522.h>
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h> 
+#include <Ticker.h>
 
+// Pin Definitions
 #define SS_PIN D8
 #define RST_PIN D0
 #define BUZZER_PIN D1
@@ -13,115 +15,182 @@
 #define BUZZER_CHANNEL 0
 #define BUZZER_RESOLUTION 8
 
+// WiFi and Supabase Configuration
 const char* ssid = "coe";
 const char* password = "12345678";
 const char* supabaseUrl = "https://cyledjoxclfmrjdfakvs.supabase.co";
 const char* supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN5bGVkam94Y2xmbXJqZGZha3ZzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDIxMzUzNjgsImV4cCI6MjA1NzcxMTM2OH0.t0XbpsgcWzI3JD-1wcjYrcZtXDfxTmNTGEf0ewS8-iI";
 
+// For ESP8266, we'll use setInsecure() for simplicity in this example
+// For production, consider using setFingerprint() or setTrustAnchors()
+const char* fingerprint = "A1 B2 C3 D4 E5 F6 07 89 10 11 12 13 14 15 16 17 18 19 20"; // Replace with your actual fingerprint
+
+// RFID and System Variables
 MFRC522 rfid(SS_PIN, RST_PIN);
 bool registrationMode = false;
-const String masterRfidUid = "D36255F5"; // master card UID C9BAF597 white wala
-unsigned long lastWiFiCheck = 0;
-const unsigned long wifiCheckInterval = 30000; 
-enum SyncState {
-    SYNC_IDLE,
-    SYNC_REGISTRATIONS,
-    SYNC_ATTENDANCE,
-    SYNC_USERS
-};
-SyncState currentSyncState = SYNC_IDLE;
-bool pendingSync = false;
+const String masterRfidUid = "533E4C1C"; // Master card UID
+
+// Timing and Sync Control
+Ticker syncTicker;
+bool needsSync = false;
+bool isSyncing = false;
+unsigned long lastSyncAttempt = 0;
+const unsigned long SYNC_RETRY_INTERVAL = 5000; // 5 seconds
+unsigned long lastCardCheck = 0;
+const unsigned long CARD_CHECK_INTERVAL = 100; // 100ms
+bool firstSyncComplete = false; // Track if first sync has occurred
+bool initialUserSyncDone = false; // Track if initial user sync is done
+uint8_t registrationExitSyncCount = 0; // Count syncs after registration exit
+const uint8_t MAX_REGISTRATION_EXIT_SYNCS = 3; // Max syncs after registration exit
 
 void setup() {
     Serial.begin(115200);
+    while (!Serial); // Wait for serial to initialize
+    Serial.println("\n\nStarting RFID Attendance System...");
+    
     SPI.begin();
     rfid.PCD_Init();
+    Serial.println("RFID Reader Initialized");
+    
     analogWriteRange(255);
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(LED_PIN, OUTPUT);
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, LOW);
-
+    Serial.println("GPIO Pins Initialized");
+    
     if (!LittleFS.begin()) {
         Serial.println("Failed to mount LittleFS");
         return;
     }
-
-    // Attempt Wi-Fi connection
+    Serial.println("LittleFS Mounted Successfully");
+    
     WiFi.begin(ssid, password);
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nConnected to WiFi");
-         playWiFiConnected();
-        syncAuthorizedUsers(); // Sync authorized users
-        playSyncComplete();
-
-    } else {
-        Serial.println("\nWi-Fi unavailable. Using local data.");
-    }
-     playStartupSound();
+    Serial.println("Connecting to WiFi...");
+    
+    // Only sync attendance periodically, not users
+    syncTicker.attach(5.0, []{ 
+        needsSync = true; 
+        Serial.println("Sync triggered by ticker (attendance only)");
+    });
+    playStartupSound();
 }
 
+
 void loop() {
-    // Periodically check Wi-Fi
-    if (millis() - lastWiFiCheck >= wifiCheckInterval) {
-        lastWiFiCheck = millis();
-        checkWiFiAndSync();
+    handleWiFi();
+    
+    // Process background sync if needed (non-blocking)
+    if (needsSync && WiFi.status() == WL_CONNECTED && !isSyncing) {
+        if (millis() - lastSyncAttempt > SYNC_RETRY_INTERVAL) {
+            Serial.println("Attempting background sync...");
+            performBackgroundSync();
+        }
+    }
+    
+    // Always check for cards with minimal delay
+    checkForCard();
+}
+
+void handleWiFi() {
+    static bool lastWiFiStatus = false;
+    bool currentWiFiStatus = (WiFi.status() == WL_CONNECTED);
+    
+    if (currentWiFiStatus != lastWiFiStatus) {
+        if (currentWiFiStatus) {
+            Serial.println("\nWiFi connected!");
+            Serial.print("IP Address: ");
+            Serial.println(WiFi.localIP());
+            playWiFiConnected();
+            
+            // Sync users on first WiFi connection if not done yet
+            if (!initialUserSyncDone) {
+                Serial.println("First WiFi connection - syncing authorized users");
+                syncAuthorizedUsers();
+                initialUserSyncDone = true;
+            }
+            
+            // Always try to sync attendance when WiFi connects
+            needsSync = true;
+        } else {
+            Serial.println("WiFi disconnected!");
+            playWiFiDisconnected();
+        }
+        lastWiFiStatus = currentWiFiStatus;
+    }
+}
+
+void performBackgroundSync() {
+    static uint8_t syncStage = 0;
+    isSyncing = true;
+    
+    Serial.printf("Starting sync stage %d\n", syncStage);
+    
+    // Process one sync stage per call (non-blocking)
+    switch(syncStage) {
+        case 0: // Sync registrations
+            if (syncLocalRegistrations()) {
+                syncStage = 1;
+                Serial.println("Registration sync complete");
+            } else {
+                Serial.println("Registration sync incomplete, will retry");
+            }
+            break;
+            
+        case 1: // Sync attendance
+            if (syncLocalAttendance()) {
+                syncStage = 0;
+                needsSync = false;
+                Serial.println("Attendance sync complete");
+            } else {
+                Serial.println("Attendance sync incomplete, will retry");
+            }
+            break;
+    }
+    
+    lastSyncAttempt = millis();
+    isSyncing = false;
+}
+
+void checkForCard() {
+    if (millis() - lastCardCheck < CARD_CHECK_INTERVAL) return;
+    lastCardCheck = millis();
+    
+    if (!rfid.PICC_IsNewCardPresent()) {
+        return;
     }
 
-    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+    if (!rfid.PICC_ReadCardSerial()) {
         return;
     }
 
     String rfidUid = getRfidUid();
     Serial.println("Scanned RFID: " + rfidUid);
 
-    // Check if master card is tapped
-    if (rfidUid == masterRfidUid) {
-        bool previousMode = registrationMode; // Store current mode
-        registrationMode = !registrationMode; // Toggle registration mode
-        playModeChangeSound();
-        
-        // If we're exiting registration mode (was true, now false)
-        if (previousMode && !registrationMode) {
-            Serial.println("Exiting registration mode - syncing authorized users");
-            if (WiFi.status() == WL_CONNECTED) {
-                syncAuthorizedUsers(); // Sync the updated user list
-            } else {
-                Serial.println("Cannot sync - WiFi not connected");
-            }
-        }
+    // Immediately display the RFID
+    Serial.print("Card UID: ");
+    for (byte i = 0; i < rfid.uid.size; i++) {
+        Serial.print(rfid.uid.uidByte[i] < 0x10 ? " 0" : " ");
+        Serial.print(rfid.uid.uidByte[i], HEX);
+    }
+    Serial.println();
 
-        Serial.println(registrationMode ? "Registration mode ON" : "Registration mode OFF");
-        tone(BUZZER_PIN, 1000, 500);
-        digitalWrite(LED_PIN, registrationMode ? HIGH : LOW);
-        rfid.PICC_HaltA();
-        rfid.PCD_StopCrypto1();
-        delay(300); // Debounce to prevent multiple reads
+    // Handle master card
+    if (rfidUid == masterRfidUid) {
+        handleMasterCard(rfidUid);
         return;
     }
 
+    // Handle regular cards
     if (registrationMode) {
-        registerNewUser(rfidUid); // Send to users table
+        Serial.println("Processing card in registration mode");
+        handleRegistration(rfidUid);
     } else {
-        if (checkLocalAccess(rfidUid)) {
-            grantAccess();
-            logAttendance(rfidUid); // Send to attendance table
-        } else {
-            denyAccess();
-        }
+        Serial.println("Processing card in attendance mode");
+        handleAttendance(rfidUid);
     }
-
-    rfid.PICC_HaltA();
-    rfid.PCD_StopCrypto1();
-    delay(100); // Small delay between card reads
 }
+
 String getRfidUid() {
     String uid = "";
     for (byte i = 0; i < rfid.uid.size; i++) {
@@ -132,93 +201,215 @@ String getRfidUid() {
     return uid;
 }
 
-void checkWiFiAndSync() {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Wi-Fi disconnected. Reconnecting...");
-        WiFi.begin(ssid, password);
-        delay(2000); // Wait for connection
-        if (WiFi.status() == WL_CONNECTED) {
-           playWiFiConnected();
-            syncAuthorizedUsers();
-            syncLocalRegistrations();
-            syncLocalAttendance();
-             playSyncComplete();
-        }
+void handleMasterCard(String rfidUid) {
+    bool previousMode = registrationMode;
+    registrationMode = !registrationMode;
+    playModeChangeSound();
+    
+    if (previousMode && !registrationMode) {
+        Serial.println("Exiting registration mode");
+        // Always sync users when exiting registration mode
+        Serial.println("Syncing authorized users after registration");
+        syncAuthorizedUsers();
     }
+
+    Serial.println(registrationMode ? "Registration mode ON" : "Registration mode OFF");
+    digitalWrite(LED_PIN, registrationMode ? HIGH : LOW);
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
 }
-void registerNewUser(String rfidUid) {
+
+void handleRegistration(String rfidUid) {
+    Serial.println("Attempting to register card: " + rfidUid);
+    if (!registerNewUser(rfidUid)) {
+        playErrorSound();
+        Serial.println("Registration failed for card: " + rfidUid);
+    } else {
+        Serial.println("Registration successful for card: " + rfidUid);
+    }
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+}
+
+bool registerNewUser(String rfidUid) {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("Wi-Fi disconnected. Storing locally.");
         logRegistrationLocally(rfidUid);
-        return;
+        return false;
     }
 
     WiFiClientSecure client;
-    client.setInsecure(); // Bypass SSL verification (remove in production)
-
-    HTTPClient http;
-    String url = String(supabaseUrl) + "/rest/v1/users";
+    client.setInsecure(); // For testing - use setFingerprint() in production
+    client.setTimeout(10000);
     
-    http.begin(client, url);
+    HTTPClient http;
+    http.setReuse(false);
+    http.setTimeout(10000);
+    
+    String url = String(supabaseUrl) + "/rest/v1/users";
+    Serial.println("Attempting to register at URL: " + url);
+    
+    if (!http.begin(client, url)) {
+        Serial.println("Failed to begin HTTP connection");
+        return false;
+    }
+    
     http.addHeader("apikey", supabaseKey);
     http.addHeader("Authorization", "Bearer " + String(supabaseKey));
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("Prefer", "return=minimal"); // Supabase optimization
+    http.addHeader("Prefer", "return=minimal");
     
     String payload = "{\"rfid_uid\":\"" + rfidUid + "\"}";
-    Serial.println("Payload: " + payload); // Debug output
+    Serial.println("Sending payload: " + payload);
 
     int httpCode = http.POST(payload);
-    String response = http.getString(); // Get server response
+    String response = http.getString();
+    
+    Serial.printf("HTTP Response Code: %d\n", httpCode);
+    Serial.println("HTTP Response: " + response);
+    
+    http.end();
 
     if (httpCode == HTTP_CODE_CREATED) {
         Serial.println("User registered successfully!");
+        playSuccessSound();
+        return true;
+    } else if (httpCode == 409) { // Conflict - already exists
+        Serial.println("User already exists - removing from local storage if present");
+        removeFromLocalRegistrations(rfidUid);
+        return true; // Consider this a success since the user exists
     } else {
         Serial.printf("Failed to register. HTTP Code: %d\n", httpCode);
         Serial.println("Response: " + response);
+        return false;
+    }
+}
+
+void removeFromLocalRegistrations(String rfidUid) {
+    if (!LittleFS.exists("/local_registrations.txt")) {
+        return;
     }
 
-    http.end();
+    File file = LittleFS.open("/local_registrations.txt", "r");
+    if (!file) {
+        return;
+    }
+
+    String remainingData;
+    bool found = false;
+    
+    while (file.available()) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        if (line != rfidUid && line.length() > 0) {
+            remainingData += line + "\n";
+        } else if (line == rfidUid) {
+            found = true;
+        }
+    }
+    file.close();
+
+    if (found) {
+        File newFile = LittleFS.open("/local_registrations.txt", "w");
+        if (newFile) {
+            newFile.print(remainingData);
+            newFile.close();
+            Serial.println("Removed duplicate registration from local storage: " + rfidUid);
+        }
+    }
 }
+
 void logRegistrationLocally(String rfidUid) {
     File file = LittleFS.open("/local_registrations.txt", "a");
     if (file) {
         file.println(rfidUid);
         file.close();
         Serial.println("Registration logged locally: " + rfidUid);
+    } else {
+        Serial.println("Failed to open local registrations file");
     }
 }
 
-void syncLocalRegistrations() {
-    if (!LittleFS.exists("/local_registrations.txt")) return;
-    
+bool syncLocalRegistrations() {
+    if (!LittleFS.exists("/local_registrations.txt")) {
+        Serial.println("No local registrations to sync");
+        return true;
+    }
+
     File file = LittleFS.open("/local_registrations.txt", "r");
-    while (file.available()) {
+    if (!file) {
+        Serial.println("Failed to open local registrations file");
+        return false;
+    }
+
+    // Process just one item per sync cycle
+    if (file.available()) {
         String rfidUid = file.readStringUntil('\n');
         rfidUid.trim();
-        if (rfidUid.length() > 0) registerNewUser(rfidUid);
+        
+        if (rfidUid.length() > 0) {
+            Serial.println("Processing local registration: " + rfidUid);
+            bool success = registerNewUser(rfidUid);
+            
+            if (success) {
+                String remainingData;
+                while (file.available()) {
+                    remainingData += file.readStringUntil('\n');
+                    remainingData += "\n";
+                }
+                file.close();
+                
+                File newFile = LittleFS.open("/local_registrations.txt", "w");
+                if (newFile) {
+                    newFile.print(remainingData);
+                    newFile.close();
+                    Serial.println("Updated local registrations file");
+                } else {
+                    Serial.println("Failed to update local registrations file");
+                }
+                return false; // More items to process
+            } else {
+                file.close();
+                return false; // Try again next time
+            }
+        }
     }
+    
     file.close();
     LittleFS.remove("/local_registrations.txt");
-    Serial.println("Local registrations synced.");
-     playSyncComplete();
+    Serial.println("All local registrations processed, file removed");
+    return true;
 }
 
+void handleAttendance(String rfidUid) {
+    Serial.println("Checking access for card: " + rfidUid);
+    if (checkLocalAccess(rfidUid)) {
+        Serial.println("Access granted for card: " + rfidUid);
+        grantAccess();
+        queueAttendance(rfidUid);
+    } else {
+        Serial.println("Access denied for card: " + rfidUid);
+        playRejectionSound();
+        denyAccess();
+    }
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+}
 
 bool checkLocalAccess(String rfidUid) {
     if (!LittleFS.exists("/authorized_users.txt")) {
-        Serial.println("authorized_users.txt does not exist. Creating it...");
         File file = LittleFS.open("/authorized_users.txt", "w");
-        if (!file) {
-            Serial.println("Failed to create authorized_users.txt");
-            return false;
+        if (file) {
+            file.close();
+            Serial.println("Created new authorized_users file");
+        } else {
+            Serial.println("Failed to create authorized_users file");
         }
-        file.close();
     }
 
     File file = LittleFS.open("/authorized_users.txt", "r");
     if (!file) {
-        Serial.println("Failed to open authorized_users.txt");
+        Serial.println("Failed to open authorized_users file");
         return false;
     }
 
@@ -247,144 +438,219 @@ void grantAccess() {
 
 void denyAccess() {
     Serial.println("Access denied");
-    playErrorSound();
+    playRejectionSound();
 }
 
-void logAttendance(String rfidUid) {
+void playRejectionSound() {
+    Serial.println("Playing rejection sound");
+    for (int i = 0; i < 3; i++) {
+        analogWrite(BUZZER_PIN, 50);
+        delay(100);
+        analogWrite(BUZZER_PIN, 0);
+        delay(100);
+    }
+}
+
+void queueAttendance(String rfidUid) {
+    // First try to sync immediately if WiFi is available
     if (WiFi.status() == WL_CONNECTED) {
-        WiFiClientSecure client;
-        client.setInsecure(); // Use this for testing. For production, add the Supabase SSL certificate.
-
-        HTTPClient http;
-        String url = String(supabaseUrl) + "/rest/v1/attendance";
-
-        http.begin(client, url);
-        http.addHeader("apikey", supabaseKey);
-        http.addHeader("Authorization", "Bearer " + String(supabaseKey));
-        http.addHeader("Content-Type", "application/json");
-
-        String payload = "{\"rfid_uid\":\"" + rfidUid + "\"}";
-
-        int httpCode = http.POST(payload);
-
-        Serial.println(httpCode == 201 ? "Attendance logged" : "Failed to log attendance, HTTP Code: " + String(httpCode));
-        Serial.println("Response: " + http.getString());
-
-        http.end();
+        Serial.println("WiFi available - attempting immediate attendance sync");
+        if (logAttendance(rfidUid)) {
+            Serial.println("Attendance synced immediately");
+            return;
+        }
+    }
+    
+    // If immediate sync failed or no WiFi, queue for later
+    File file = LittleFS.open("/attendance_queue.txt", "a");
+    if (file) {
+        file.println(rfidUid);
+        file.close();
+        needsSync = true;
+        Serial.println("Attendance queued for sync: " + rfidUid);
     } else {
-        Serial.println("Wi-Fi not connected. Attendance logged locally.");
-        logAttendanceLocally(rfidUid);
+        Serial.println("Failed to queue attendance");
     }
 }
 
-void logAttendanceLocally(String rfidUid) {
-    File file = LittleFS.open("/local_attendance.txt", "a");
-    if (!file) {
-        Serial.println("Failed to open local_attendance.txt");
-        return;
-    }
-    file.println(rfidUid);
-    file.close();
-    Serial.println("Attendance logged locally for UID: " + rfidUid);
-}
+bool logAttendance(String rfidUid) {
+    WiFiClientSecure client;
+    client.setInsecure(); // For testing - use setFingerprint() in production
+    client.setTimeout(10000);
+    
+    HTTPClient http;
+    http.setReuse(false);
+    http.setTimeout(10000);
 
-void syncLocalAttendance() {
-    if (!LittleFS.exists("/local_attendance.txt")) {
-        Serial.println("No local attendance data to sync.");
-        return;
-    }
+    String url = String(supabaseUrl) + "/rest/v1/attendance";
+    Serial.println("Logging attendance at URL: " + url);
 
-    File file = LittleFS.open("/local_attendance.txt", "r");
-    if (!file) {
-        Serial.println("Failed to open local_attendance.txt for reading");
-        return;
+    if (!http.begin(client, url)) {
+        Serial.println("HTTP begin failed");
+        return false;
     }
 
-    while (file.available()) {
-        String rfidUid = file.readStringUntil('\n');
-        rfidUid.trim();
-        if (rfidUid.length() > 0) {
-            logAttendance(rfidUid); // Log attendance to the server
+    http.addHeader("apikey", supabaseKey);
+    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Prefer", "return=minimal");
+
+    String payload = "{\"rfid_uid\":\"" + rfidUid + "\"}";
+    Serial.println("Sending payload: " + payload);
+    
+    int httpCode = http.POST(payload);
+    String response = http.getString();
+    
+    Serial.printf("HTTP Response Code: %d\n", httpCode);
+    Serial.println("HTTP Response: " + response);
+    
+    if (httpCode > 0) {
+        if (httpCode == HTTP_CODE_CREATED) {
+            http.end();
+            Serial.println("Attendance logged successfully");
+            return true;
         }
     }
 
-    file.close();
-    LittleFS.remove("/local_attendance.txt"); // Clear local attendance data after syncing
-    Serial.println("Local attendance data synced and cleared.");
-     playSyncComplete();
+    http.end();
+    return false;
 }
 
-void syncAuthorizedUsers() {
+void logAttendanceLocally(String rfidUid) {
+    File file = LittleFS.open("/attendance_queue.txt", "a");
+    if (file) {
+        file.println(rfidUid);
+        file.close();
+        Serial.println("Attendance logged locally for UID: " + rfidUid);
+    } else {
+        Serial.println("Failed to log attendance locally");
+    }
+}
+
+bool syncLocalAttendance() {
+    if (!LittleFS.exists("/attendance_queue.txt")) {
+        Serial.println("No attendance records to sync");
+        return true;
+    }
+
+    File file = LittleFS.open("/attendance_queue.txt", "r");
+    if (!file) {
+        Serial.println("Failed to open attendance queue file");
+        return false;
+    }
+
+    // Process just one item per sync cycle
+    if (file.available()) {
+        String rfidUid = file.readStringUntil('\n');
+        rfidUid.trim();
+        
+        if (rfidUid.length() > 0) {
+            Serial.println("Processing queued attendance: " + rfidUid);
+            bool success = logAttendance(rfidUid);
+            
+            if (success) {
+                String remainingData;
+                while (file.available()) {
+                    remainingData += file.readStringUntil('\n');
+                    remainingData += "\n";
+                }
+                file.close();
+                
+                File newFile = LittleFS.open("/attendance_queue.txt", "w");
+                if (newFile) {
+                    newFile.print(remainingData);
+                    newFile.close();
+                    Serial.println("Updated attendance queue file");
+                } else {
+                    Serial.println("Failed to update attendance queue file");
+                }
+                return false; // More items to process
+            } else {
+                file.close();
+                return false; // Try again next time
+            }
+        }
+    }
+    
+    file.close();
+    LittleFS.remove("/attendance_queue.txt");
+    Serial.println("All queued attendance processed, file removed");
+    return true;
+}
+
+bool syncAuthorizedUsers() {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("Network unavailable. Cannot sync users.");
-        return;
+        return false;
     }
 
     WiFiClientSecure client;
-    client.setInsecure();  // Skip SSL validation (for development)
-
+    client.setInsecure(); // For testing - use setFingerprint() in production
+    client.setTimeout(15000);
+    
     HTTPClient https;
-    String url = String(supabaseUrl) + "/rest/v1/users";  // Corrected table name
+    https.setReuse(false);
+    https.setTimeout(15000);
 
-    Serial.println("Connecting to: " + url);
-    https.begin(client, url);
+    String url = String(supabaseUrl) + "/rest/v1/users?select=rfid_uid";
+    Serial.println("Fetching authorized users from: " + url);
+
+    if (!https.begin(client, url)) {
+        Serial.println("Failed to begin HTTP connection");
+        return false;
+    }
+
     https.addHeader("apikey", supabaseKey);
     https.addHeader("Authorization", "Bearer " + String(supabaseKey));
 
     int httpCode = https.GET();
     String payload = https.getString();
+    
+    Serial.printf("HTTP Response Code: %d\n", httpCode);
+    Serial.println("HTTP Response: " + payload);
+    
+    https.end();
 
-    Serial.println("HTTP Response Code: " + String(httpCode));
-    Serial.println("Response: " + payload);
-
-    if (httpCode == HTTP_CODE_OK) {
-        // Parse the JSON response
-        DynamicJsonDocument doc(1024);
-        DeserializationError error = deserializeJson(doc, payload);
-        if (error) {
-            Serial.println("Failed to parse JSON: " + String(error.c_str()));
-            https.end();
-            return;
-        }
-
-        // Clean LittleFS before writing new data
-        LittleFS.remove("/authorized_users.txt");
-
-        // Open the authorized_users.txt file for writing
-        File file = LittleFS.open("/authorized_users.txt", "w");
-        if (!file) {
-            Serial.println("Failed to open authorized_users.txt for writing");
-            https.end();
-            return;
-        }
-
-        // Write each RFID UID to the file
-        for (JsonObject user : doc.as<JsonArray>()) {
-            String rfidUid = user["rfid_uid"].as<String>();
-            file.println(rfidUid);
-            Serial.println("Synced UID: " + rfidUid);
-        }
-
-        file.close();
-        Serial.println("Authorized Users Synced Successfully!");
-         playSyncComplete();
-    } else {
-        Serial.println("Failed to sync users. HTTP Code: " + String(httpCode));
+    if (httpCode != HTTP_CODE_OK) {
+        Serial.println("Failed to sync users");
+        return false;
     }
 
-    https.end();
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+        Serial.println("JSON parse error: " + String(error.c_str()));
+        return false;
+    }
+
+    // Clear previous data before syncing new data
+    LittleFS.remove("/authorized_users.txt");
+    File file = LittleFS.open("/authorized_users.txt", "w");
+    if (!file) {
+        Serial.println("Failed to create authorized users file");
+        return false;
+    }
+
+    Serial.println("Updating authorized users list:");
+    for (JsonObject user : doc.as<JsonArray>()) {
+        String rfidUid = user["rfid_uid"].as<String>();
+        file.println(rfidUid);
+        Serial.println(" - " + rfidUid);
+    }
+
+    file.close();
+    Serial.println("Authorized Users Synced Successfully!");
+    return true;
 }
 
 
-
-
-
+// Sound functions
 void playWiFiConnected() {
-    // Ascending chime for connection established
-    int melody[] = {262, 330, 392, 523}; // C4, E4, G4, C5
+    Serial.println("Playing WiFi connected sound");
+    int melody[] = {262, 330, 392, 523};
     for (int note : melody) {
         analogWriteFreq(note);
-        analogWrite(BUZZER_PIN, 50); // 50/255 volume
+        analogWrite(BUZZER_PIN, 50);
         delay(150);
         analogWrite(BUZZER_PIN, 0);
         delay(30);
@@ -392,8 +658,8 @@ void playWiFiConnected() {
 }
 
 void playWiFiDisconnected() {
-    // Descending chime for disconnection
-    int melody[] = {523, 392, 330, 262}; // C5, G4, E4, C4
+    Serial.println("Playing WiFi disconnected sound");
+    int melody[] = {523, 392, 330, 262};
     for (int note : melody) {
         analogWriteFreq(note);
         analogWrite(BUZZER_PIN, 40);
@@ -404,8 +670,8 @@ void playWiFiDisconnected() {
 }
 
 void playSyncComplete() {
-    // Happy three-tone sequence
-    int melody[] = {330, 392, 494}; // E4, G4, B4
+    Serial.println("Playing sync complete sound");
+    int melody[] = {330, 392, 494};
     for (int note : melody) {
         analogWriteFreq(note);
         analogWrite(BUZZER_PIN, 60);
@@ -416,8 +682,8 @@ void playSyncComplete() {
 }
 
 void playStartupSound() {
-    // Welcome sequence
-    int melody[] = {392, 0, 392, 523}; // G4, pause, G4, C5
+    Serial.println("Playing startup sound");
+    int melody[] = {392, 0, 392, 523};
     for (int note : melody) {
         if (note == 0) {
             analogWrite(BUZZER_PIN, 0);
@@ -432,27 +698,8 @@ void playStartupSound() {
     }
 }
 
-void playSoftBeep() {
-    for (int i = 0; i < 2; i++) {
-        analogWrite(BUZZER_PIN, 60);
-        delay(50);
-        analogWrite(BUZZER_PIN, 0);
-        delay(100);
-    }
-}
-
-void playWindChime() {
-    int notes[] = {300, 400, 500, 400, 300};
-    for (int note : notes) {
-        analogWrite(BUZZER_PIN, note/4);
-        delay(80);
-        analogWrite(BUZZER_PIN, 0);
-        delay(20);
-    }
-}
-
-
 void playSuccessSound() {
+    Serial.println("Playing success sound");
     for (int i = 200; i < 800; i += 50) {
         analogWrite(BUZZER_PIN, i/4);
         delay(30);
@@ -461,6 +708,7 @@ void playSuccessSound() {
 }
 
 void playErrorSound() {
+    Serial.println("Playing error sound");
     analogWrite(BUZZER_PIN, 50);
     delay(100);
     analogWrite(BUZZER_PIN, 0);
@@ -471,6 +719,7 @@ void playErrorSound() {
 }
 
 void playModeChangeSound() {
+    Serial.println("Playing mode change sound");
     for (int i = 200; i <= 400; i += 10) {
         analogWrite(BUZZER_PIN, i/4);
         delay(10);
